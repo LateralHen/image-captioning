@@ -1,0 +1,578 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+import torchvision.transforms as T
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from PIL import Image
+from transformers import (
+    VisionEncoderDecoderModel,
+    GPT2Tokenizer,
+    ViTImageProcessor,
+)
+import sacrebleu
+from tqdm.auto import tqdm
+import time
+import json
+import math
+import shutil
+
+# Riproducibilita'
+torch.manual_seed(42)
+np.random.seed(42)
+
+# Device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {device}")
+print(f"GPU: {torch.cuda.get_device_name(0)}")
+print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+# Path del progetto
+PROJECT_ROOT = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
+DATA_DIR = PROJECT_ROOT / "data" / "flickr8k"
+IMAGES_DIR = DATA_DIR / "Images"
+SPLIT_FILE = DATA_DIR / "captions_with_split.csv"
+CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
+INITIAL_MODEL_DIR = CHECKPOINT_DIR / "model_initial"
+SCENARIO_B_DIR = CHECKPOINT_DIR / "scenario_B"
+SCENARIO_B_DIR.mkdir(exist_ok=True)
+OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+
+# Iperparametri Scenario B
+NUM_EPOCHS = 25                  # budget massimo
+EARLY_STOP_PATIENCE = 3          # epoche senza miglioramento BLEU prima di fermarsi
+LEARNING_RATE = 5e-5             # peak LR (dopo warmup)
+WEIGHT_DECAY = 0.01
+WARMUP_RATIO = 1/25              # 1 epoca su 25 = warmup
+BATCH_SIZE = 32
+NUM_WORKERS = 0
+MAX_LENGTH = 30
+GRAD_CLIP = 1.0
+LABEL_SMOOTHING = 0.1
+VAL_BLEU_SUBSET_SIZE = 200       # immagini campionate dal val per BLEU rapido
+
+print(f"\n=== Iperparametri Scenario B ===")
+print(f"Budget epoche:          {NUM_EPOCHS}")
+print(f"Early stopping:         {EARLY_STOP_PATIENCE} epoche senza miglioramento BLEU")
+print(f"Peak learning rate:     {LEARNING_RATE}")
+print(f"Warmup ratio:           {WARMUP_RATIO:.3f} (= {int(WARMUP_RATIO*NUM_EPOCHS)} epoche)")
+print(f"Label smoothing:        {LABEL_SMOOTHING}")
+print(f"Batch size:             {BATCH_SIZE}")
+print(f"Val BLEU subset size:   {VAL_BLEU_SUBSET_SIZE} immagini per validazione rapida")
+
+# Statistiche di normalizzazione di ImageNet (le stesse usate da ViT)
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+# Trasformazioni di TRAINING: con augmentation
+train_transforms = T.Compose([
+    T.RandomResizedCrop(
+        size=224,
+        scale=(0.8, 1.0),       # ritaglia tra 80% e 100% dell'area
+        ratio=(0.9, 1.1),       # leggera variazione del rapporto h/w
+    ),
+    T.RandomHorizontalFlip(p=0.5),
+    T.ColorJitter(
+        brightness=0.2,
+        contrast=0.2,
+        saturation=0.2,
+        hue=0.05,
+    ),
+    T.ToTensor(),
+    T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
+
+# Trasformazioni di VALIDAZIONE/TEST: pulite, deterministiche
+eval_transforms = T.Compose([
+    T.Resize(256),                # resize del lato corto a 256
+    T.CenterCrop(224),            # crop centrale 224x224
+    T.ToTensor(),
+    T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
+
+
+class Flickr8kCaptionsDataset(Dataset):
+    """Dataset PyTorch per Flickr8k con augmentation opzionale.
+    
+    Sostituisce la classe del notebook 03: invece di usare l'image_processor
+    di Hugging Face per le trasformazioni, usa torchvision (piu' flessibile per
+    aggiungere augmentation).
+    """
+    
+    def __init__(self, df_split, images_dir, transforms_fn, tokenizer, max_length=30):
+        self.df = df_split.reset_index(drop=True)
+        self.images_dir = images_dir
+        self.transforms = transforms_fn
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+    
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        
+        # 1. Carica e trasforma l'immagine
+        img_path = self.images_dir / row['image']
+        image = Image.open(img_path).convert("RGB")
+        pixel_values = self.transforms(image)
+        
+        # 2. Tokenizza la didascalia (identico al notebook 03)
+        caption = row['caption']
+        text = self.tokenizer.bos_token + " " + caption + " " + self.tokenizer.eos_token
+        encoding = self.tokenizer(
+            text, padding="max_length", max_length=self.max_length,
+            truncation=True, return_tensors="pt",
+        )
+        input_ids = encoding["input_ids"].squeeze(0)
+        attention_mask = encoding["attention_mask"].squeeze(0)
+        labels = input_ids.clone()
+        labels[attention_mask == 0] = -100
+        
+        return {
+            "pixel_values": pixel_values,
+            "labels": labels,
+            "image_filename": row['image'],  # utile per la val con BLEU
+            "caption_text": caption,          # utile per la val con BLEU
+        }
+
+
+# Carico il modello iniziale (stesso punto di partenza dello Scenario A)
+print("Caricamento modello iniziale...")
+model = VisionEncoderDecoderModel.from_pretrained(INITIAL_MODEL_DIR)
+tokenizer = GPT2Tokenizer.from_pretrained(INITIAL_MODEL_DIR)
+image_processor = ViTImageProcessor.from_pretrained(INITIAL_MODEL_DIR)
+tokenizer.pad_token = tokenizer.eos_token
+
+model = model.to(device)
+print(f"Modello su {device}, {sum(p.numel() for p in model.parameters())/1e6:.1f}M parametri")
+
+# Carico split
+df = pd.read_csv(SPLIT_FILE)
+train_df = df[df['split'] == 'train']
+val_df = df[df['split'] == 'val']
+
+train_dataset = Flickr8kCaptionsDataset(train_df, IMAGES_DIR, train_transforms, tokenizer, MAX_LENGTH)
+val_dataset = Flickr8kCaptionsDataset(val_df, IMAGES_DIR, eval_transforms, tokenizer, MAX_LENGTH)
+
+train_loader = DataLoader(
+    train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+    num_workers=NUM_WORKERS, pin_memory=True,
+)
+val_loader = DataLoader(
+    val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+    num_workers=NUM_WORKERS, pin_memory=True,
+)
+
+print(f"\nTrain: {len(train_dataset)} esempi, {len(train_loader)} batch (con augmentation)")
+print(f"Val:   {len(val_dataset)} esempi, {len(val_loader)} batch (senza augmentation)")
+
+import matplotlib.pyplot as plt
+
+# Funzione per "denormalizzare" un tensore e riportarlo a immagine visibile
+def denormalize(tensor):
+    mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
+    return (tensor.cpu() * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
+
+
+# Estrae 4 versioni augmentate della stessa immagine
+fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+fig.suptitle("Stessa immagine, 4 augmentation diverse (a ogni epoca il modello la vede diversa)", fontsize=12)
+
+# Forziamo lo stesso indice 4 volte; il dataset applica augmentation random ogni chiamata
+sample_idx = 0
+for i in range(4):
+    sample = train_dataset[sample_idx]
+    img_visualizable = denormalize(sample['pixel_values'])
+    axes[i].imshow(img_visualizable)
+    axes[i].axis('off')
+    axes[i].set_title(f"Variante {i+1}")
+
+plt.tight_layout()
+plt.show()
+
+# Sanity check sulle dimensioni
+print(f"\nForma pixel_values: {sample['pixel_values'].shape}")
+print(f"Range tensore (normalizzato): [{sample['pixel_values'].min():.2f}, {sample['pixel_values'].max():.2f}]")
+print(f"Caption originale: {sample['caption_text']!r}")
+print(f"Filename: {sample['image_filename']}")
+
+# === Optimizer ===
+optimizer = AdamW(
+    model.parameters(),
+    lr=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY,
+)
+
+# === LR Scheduler: warmup linear + cosine decay ===
+total_steps = len(train_loader) * NUM_EPOCHS
+warmup_steps = int(WARMUP_RATIO * total_steps)
+
+def lr_lambda(current_step: int):
+    """Restituisce un fattore moltiplicativo per LEARNING_RATE in base allo step.
+    
+    - Warmup: cresce linearmente da 0 a 1
+    - Decay: scende da 1 a 0 seguendo una curva coseno
+    """
+    if current_step < warmup_steps:
+        # warmup lineare
+        return current_step / max(1, warmup_steps)
+    else:
+        # cosine decay
+        progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+scheduler = LambdaLR(optimizer, lr_lambda)
+
+print(f"Total training steps: {total_steps}")
+print(f"Warmup steps:         {warmup_steps} ({warmup_steps/total_steps*100:.1f}% del totale)")
+
+# === Label smoothing loss ===
+# Definiamo la loss "a mano" con label_smoothing, perche' VisionEncoderDecoderModel
+# di Hugging Face usa una loss interna senza smoothing.
+loss_fn = nn.CrossEntropyLoss(
+    ignore_index=-100,        # ignora padding (gia' settato a -100 nel Dataset)
+    label_smoothing=LABEL_SMOOTHING,
+)
+print(f"Loss: CrossEntropyLoss con label_smoothing={LABEL_SMOOTHING}")
+
+# === Mixed precision (gia' usato nel notebook 03) ===
+use_amp = torch.cuda.is_bf16_supported()
+amp_dtype = torch.bfloat16 if use_amp else torch.float32
+print(f"Mixed precision: {'attiva (bfloat16)' if use_amp else 'non disponibile'}")
+
+# Visualizziamo la curva del LR per verifica
+fig, ax = plt.subplots(figsize=(10, 4))
+test_steps = list(range(0, total_steps + 1, max(1, total_steps // 200)))
+test_lrs = [LEARNING_RATE * lr_lambda(s) for s in test_steps]
+ax.plot(test_steps, test_lrs)
+ax.axvline(warmup_steps, color='red', linestyle='--', alpha=0.5, label=f'Fine warmup (step {warmup_steps})')
+ax.set_xlabel('Step')
+ax.set_ylabel('Learning rate')
+ax.set_title(f'LR schedule: linear warmup + cosine decay (peak={LEARNING_RATE})')
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+def compute_loss_with_smoothing(outputs, labels, loss_fn):
+    """Calcola la loss con label smoothing.
+    
+    VisionEncoderDecoderModel di transformers shifta gia' i labels internamente
+    quando produce outputs.logits. Quindi possiamo confrontare direttamente
+    logits e labels senza shift manuale.
+    
+    Verifica empirica: con loss_fn senza smoothing, questa funzione produce
+    lo stesso valore di outputs.loss (testato nella cella di debug).
+    """
+    logits = outputs.logits  # (batch, seq_len, vocab_size) - gia' shiftati da HF
+    
+    loss = loss_fn(
+        logits.view(-1, logits.size(-1)),
+        labels.view(-1),
+    )
+    return loss
+
+
+def train_one_epoch(model, loader, optimizer, scheduler, loss_fn, device, epoch):
+    """Una epoca di training. Ritorna la loss media."""
+    model.train()
+    total_loss = 0.0
+    n_batches = len(loader)
+    
+    pbar = tqdm(loader, desc=f"Epoca {epoch} [train]", leave=False)
+    for batch in pbar:
+        pixel_values = batch['pixel_values'].to(device, non_blocking=True)
+        labels = batch['labels'].to(device, non_blocking=True)
+        
+        optimizer.zero_grad()
+        
+        with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+            outputs = model(pixel_values=pixel_values, labels=labels)
+            loss = compute_loss_with_smoothing(outputs, labels, loss_fn)
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        optimizer.step()
+        scheduler.step()  # IMPORTANTE: aggiornamento dello scheduler dopo ogni step
+        
+        total_loss += loss.item()
+        current_lr = scheduler.get_last_lr()[0]
+        pbar.set_postfix({'loss': f'{loss.item():.3f}', 'lr': f'{current_lr:.2e}'})
+    
+    return total_loss / n_batches
+
+
+@torch.no_grad()
+def evaluate_loss(model, loader, loss_fn, device):
+    """Validazione: ritorna la loss media."""
+    model.eval()
+    total_loss = 0.0
+    n_batches = len(loader)
+    
+    for batch in tqdm(loader, desc="Val [loss]", leave=False):
+        pixel_values = batch['pixel_values'].to(device, non_blocking=True)
+        labels = batch['labels'].to(device, non_blocking=True)
+        
+        with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+            outputs = model(pixel_values=pixel_values, labels=labels)
+            loss = compute_loss_with_smoothing(outputs, labels, loss_fn)
+        
+        total_loss += loss.item()
+    
+    return total_loss / n_batches
+
+
+@torch.no_grad()
+def generate_caption_batch(model, pixel_values_batch, tokenizer, device):
+    """Genera didascalie per un batch di immagini.
+    
+    Versione batch della funzione del notebook 04. Stesso workaround per il
+    bug GPT-2 BOS/EOS: forziamo decoder_input_ids = [[BOS, BOS]] per ogni esempio.
+    """
+    batch_size = pixel_values_batch.size(0)
+    decoder_input_ids = torch.tensor(
+        [[tokenizer.bos_token_id, tokenizer.bos_token_id]] * batch_size,
+        device=device,
+    )
+    
+    output_ids = model.generate(
+        pixel_values=pixel_values_batch,
+        decoder_input_ids=decoder_input_ids,
+        max_length=MAX_LENGTH,
+        num_beams=4,
+        early_stopping=True,
+        no_repeat_ngram_size=3,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+    )
+    
+    captions = [
+        tokenizer.decode(ids, skip_special_tokens=True).strip()
+        for ids in output_ids
+    ]
+    return captions
+
+
+@torch.no_grad()
+def evaluate_bleu_subset(model, val_df, images_dir, eval_transforms,
+                         tokenizer, device, n_samples=200, batch_size=16):
+    """Calcola BLEU su un sottoinsieme del val set.
+    
+    Note: campioniamo immagini uniche, non righe del CSV. Per ogni immagine
+    confrontiamo la didascalia generata con tutte le 5 reference umane.
+    """
+    model.eval()
+    
+    # Campiona n_samples immagini uniche dal validation set (deterministico via seed numpy)
+    unique_imgs = val_df['image'].unique()
+    rng = np.random.default_rng(seed=42)
+    sampled_imgs = rng.choice(unique_imgs, size=min(n_samples, len(unique_imgs)), replace=False)
+    
+    generated_captions = []
+    references_per_image = []
+    
+    # Genera in batch per efficienza
+    pbar = tqdm(range(0, len(sampled_imgs), batch_size), desc="Val [BLEU]", leave=False)
+    for batch_start in pbar:
+        batch_imgs = sampled_imgs[batch_start:batch_start + batch_size]
+        
+        # Carica e trasforma le immagini del batch
+        pixel_values_list = []
+        for img_name in batch_imgs:
+            image = Image.open(images_dir / img_name).convert("RGB")
+            pixel_values_list.append(eval_transforms(image))
+        pixel_values_batch = torch.stack(pixel_values_list).to(device)
+        
+        # Genera didascalie
+        with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+            batch_captions = generate_caption_batch(model, pixel_values_batch, tokenizer, device)
+        
+        for img_name, gen_cap in zip(batch_imgs, batch_captions):
+            generated_captions.append(gen_cap)
+            refs = val_df[val_df['image'] == img_name]['caption'].tolist()
+            references_per_image.append(refs)
+    
+    # Calcola BLEU
+    references_transposed = [list(refs) for refs in zip(*references_per_image)]
+    bleu = sacrebleu.corpus_bleu(generated_captions, references_transposed)
+    
+    return {
+        'BLEU-1': bleu.precisions[0],
+        'BLEU-2': bleu.precisions[1],
+        'BLEU-3': bleu.precisions[2],
+        'BLEU-4': bleu.precisions[3],
+        'BLEU_corpus': bleu.score,
+        'n_samples': len(sampled_imgs),
+    }
+
+
+print("Funzioni di train e validation definite.")
+print(f"  evaluate_bleu_subset valuta su {VAL_BLEU_SUBSET_SIZE} immagini del val set")
+
+# Sanity check: chiamiamo la val BLEU su 50 immagini
+# Sul modello senza training, BLEU sara' molto basso (~3-5) perche' la cross-attention
+# e' inizializzata random. E' atteso, ci serve solo per verificare che la funzione gira.
+
+print("Test della funzione evaluate_bleu_subset su 50 immagini (sul modello non addestrato)...")
+print("Tempo atteso: ~30 secondi")
+print()
+
+t0 = time.time()
+test_bleu = evaluate_bleu_subset(
+    model, val_df, IMAGES_DIR, eval_transforms,
+    tokenizer, device, n_samples=50, batch_size=16,
+)
+elapsed = time.time() - t0
+
+print(f"Tempo: {elapsed:.1f}s")
+print(f"BLEU sulla cross-attention NON ADDESTRATA (atteso bassissimo):")
+for k, v in test_bleu.items():
+    if k.startswith('BLEU'):
+        print(f"  {k}: {v:.2f}")
+        
+# === DEBUG: la nostra loss a mano e' uguale a quella standard di HF? ===
+print("Confronto: loss 'a mano' (con label smoothing) vs loss HF (senza smoothing)")
+print()
+
+batch = next(iter(train_loader))
+pixel_values = batch['pixel_values'].to(device)
+labels = batch['labels'].to(device)
+
+model.eval()
+with torch.no_grad():
+    outputs = model(pixel_values=pixel_values, labels=labels)
+    
+    # Loss "a mano" attuale (con shift)
+    loss_manual_with_shift = compute_loss_with_smoothing(outputs, labels, loss_fn)
+    
+    # Loss "a mano" SENZA fare il shift (test alternativo)
+    loss_fn_no_smoothing = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.0)
+    loss_manual_no_shift = loss_fn_no_smoothing(
+        outputs.logits.view(-1, outputs.logits.size(-1)),
+        labels.view(-1),
+    )
+    
+    # Loss "a mano" CON shift ma senza smoothing
+    shift_logits = outputs.logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    loss_manual_shift_nosmooth = loss_fn_no_smoothing(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+    )
+    
+    # Loss standard di Hugging Face
+    loss_hf = outputs.loss
+
+print(f"Loss HF (riferimento, no smoothing):     {loss_hf.item():.4f}")
+print(f"Loss a mano CON shift, NO smoothing:     {loss_manual_shift_nosmooth.item():.4f}")
+print(f"Loss a mano NO shift, NO smoothing:      {loss_manual_no_shift.item():.4f}")
+print(f"Loss a mano CON shift, smoothing 0.1:    {loss_manual_with_shift.item():.4f}  <-- quella usata nel training")
+
+# History accumulata
+history = {
+    'epoch': [],
+    'train_loss': [],
+    'val_loss': [],
+    'val_bleu_1': [],
+    'val_bleu_4': [],
+    'val_bleu_corpus': [],
+    'lr_at_end_of_epoch': [],
+    'epoch_time_sec': [],
+}
+
+# Stato per early stopping e best tracking
+best_bleu4 = -1.0
+best_epoch = 0
+epochs_since_improvement = 0
+HISTORY_FILE = OUTPUTS_DIR / "scenario_B_history.json"
+BEST_DIR = SCENARIO_B_DIR / "best"
+LAST_DIR = SCENARIO_B_DIR / "last"
+
+print(f"=== Avvio training Scenario B ===")
+print(f"Budget: {NUM_EPOCHS} epoche, early stopping con patience {EARLY_STOP_PATIENCE}")
+print(f"Stima conservativa tempo totale: 4-7 ore (puo' fermarsi prima per early stop)")
+print(f"Best model in:    {BEST_DIR}")
+print(f"Last model in:    {LAST_DIR}  (sovrascritto ad ogni epoca, antinfortunistica)")
+print()
+
+overall_start = time.time()
+
+for epoch in range(1, NUM_EPOCHS + 1):
+    epoch_start = time.time()
+    
+    # 1. Train
+    train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, epoch)
+    
+    # 2. Validation loss
+    val_loss = evaluate_loss(model, val_loader, loss_fn, device)
+    
+    # 3. Validation BLEU su sottoinsieme
+    val_bleu = evaluate_bleu_subset(
+        model, val_df, IMAGES_DIR, eval_transforms,
+        tokenizer, device, n_samples=VAL_BLEU_SUBSET_SIZE, batch_size=16,
+    )
+    
+    epoch_time = time.time() - epoch_start
+    current_lr = scheduler.get_last_lr()[0]
+    
+    # Aggiorna history
+    history['epoch'].append(epoch)
+    history['train_loss'].append(train_loss)
+    history['val_loss'].append(val_loss)
+    history['val_bleu_1'].append(val_bleu['BLEU-1'])
+    history['val_bleu_4'].append(val_bleu['BLEU-4'])
+    history['val_bleu_corpus'].append(val_bleu['BLEU_corpus'])
+    history['lr_at_end_of_epoch'].append(current_lr)
+    history['epoch_time_sec'].append(epoch_time)
+    
+    # Salva history su disco (per non perdere niente in caso di crash)
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=2)
+    
+    # 4. Salvataggi su disco
+    # 4a. SEMPRE salva il "last" (ultimo stato del modello, antinfortunistica per crash)
+    if LAST_DIR.exists():
+        shutil.rmtree(LAST_DIR)
+    model.save_pretrained(LAST_DIR)
+    
+    # 4b. Salva il "best" SOLO se BLEU-4 e' migliorato
+    is_best = val_bleu['BLEU-4'] > best_bleu4
+    if is_best:
+        best_bleu4 = val_bleu['BLEU-4']
+        best_epoch = epoch
+        epochs_since_improvement = 0
+        
+        if BEST_DIR.exists():
+            shutil.rmtree(BEST_DIR)
+        model.save_pretrained(BEST_DIR)
+        marker = "[BEST!]"
+    else:
+        epochs_since_improvement += 1
+        marker = f"(no improv x{epochs_since_improvement})"
+    
+    # Stampa riassunto epoca
+    print(f"Epoca {epoch:2d}/{NUM_EPOCHS} | "
+          f"train: {train_loss:.3f} | val: {val_loss:.3f} | "
+          f"BLEU-1: {val_bleu['BLEU-1']:.2f} | "
+          f"BLEU-4: {val_bleu['BLEU-4']:.2f} | "
+          f"lr: {current_lr:.2e} | "
+          f"tempo: {epoch_time/60:.1f}min | "
+          f"{marker}")
+    
+    # 5. Early stopping
+    if epochs_since_improvement >= EARLY_STOP_PATIENCE:
+        print(f"\n>>> Early stopping: BLEU-4 non migliora da {EARLY_STOP_PATIENCE} epoche consecutive")
+        break
+
+total_time = time.time() - overall_start
+print(f"\n=== Training completato in {total_time/60:.1f} minuti ({total_time/3600:.1f} ore) ===")
+print(f"Best epoca:  {best_epoch}")
+print(f"Best BLEU-4: {best_bleu4:.2f}")
+print(f"Best model salvato in: {BEST_DIR}")
+print(f"Last model salvato in: {LAST_DIR}")
