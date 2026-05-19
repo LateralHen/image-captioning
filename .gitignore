@@ -1,0 +1,34 @@
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# Dati e checkpoint (troppo grandi per git)
+data/
+datasets/
+checkpoints/
+outputs/
+*.pth
+*.onnx
+*.pkl
+
+# Credenziali (mai su git!)
+kaggle.json
+*.env
+.env.*
+
+# Sistema e Terminale
+.DS_Store
+Thumbs.db
+*.log
+
+# Editor (Micro, VS Code, JetBrains)
+.vscode/
+.idea/
+*~
+*.swp
