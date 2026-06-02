@@ -1,0 +1,10 @@
+{
+  "n_images": 1906,
+  "BLEU-1": 71.13,
+  "BLEU-2": 37.33,
+  "BLEU-3": 20.36,
+  "BLEU-4": 11.13,
+  "BLEU_corpus": 27.85,
+  "avg_generated_length": 12.43,
+  "avg_reference_length": 12.13
+}

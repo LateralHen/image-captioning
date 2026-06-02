@@ -1,0 +1,16 @@
+{
+  "experiment": "scenario_A_baseline",
+  "model": "ViT-base + GPT-2 small",
+  "dataset": "Flickr8k",
+  "best_epoch": 2,
+  "best_val_loss": 1.947,
+  "BLEU_1": 65.72,
+  "BLEU_2": 32.27,
+  "BLEU_3": 16.72,
+  "BLEU_4": 8.31,
+  "BLEU_corpus": 23.3,
+  "brevity_penalty": 1.0,
+  "avg_generated_length": 12.13,
+  "avg_reference_length": 11.68,
+  "n_test_images": 1091
+}

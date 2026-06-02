@@ -10,9 +10,7 @@ __pycache__/
 
 # Dati e checkpoint (troppo grandi per git)
 data/
-datasets/
 checkpoints/
-outputs/
 *.pth
 *.onnx
 *.pkl

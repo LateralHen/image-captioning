@@ -1,0 +1,5 @@
+Esperimento,Dataset training,Dataset test,BLEU-1,BLEU-4,BLEU corpus
+Scenario A (baseline),Flickr8k,Flickr8k,65.72,8.31,23.3
+Scenario B (Settimana 1),Flickr8k,Flickr8k,68.3,9.8,25.77
+Settimana 2,Flickr30k,Flickr8k,79.57,18.99,39.61
+Settimana 2,Flickr30k,Flickr30k,70.17,10.49,26.9
