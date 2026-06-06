@@ -7,7 +7,7 @@ Mostra il picco a epoca 6 (best checkpoint) e la zona di overfitting da epoca 7.
 Uso:
     python make_val_bleu4_trajectory_week3.py
 Output:
-    val_bleu4_trajectory_week3.png  (nella cartella corrente)
+    graph/val_bleu4_trajectory_week3.png  (nella cartella corrente)
 """
 
 import matplotlib
@@ -64,5 +64,5 @@ ax.spines["bottom"].set_color(GREY)
 ax.tick_params(colors=GREY)
 
 plt.tight_layout()
-plt.savefig("val_bleu4_trajectory_week3.png", bbox_inches="tight", facecolor="white")
-print("Salvato: val_bleu4_trajectory_week3.png")
+plt.savefig("graph/val_bleu4_trajectory_week3.png", bbox_inches="tight", facecolor="white")
+print("Salvato: graph/val_bleu4_trajectory_week3.png")
