@@ -60,6 +60,6 @@ legend_handles = [
 ax.legend(handles=legend_handles, fontsize=8.5, loc="upper left", framealpha=0.85)
 
 plt.tight_layout()
-filename_png = "plot3_waterfall.png"
+filename_png = "graph/plot3_waterfall.png"
 plt.savefig(filename_png, dpi=300, bbox_inches="tight")
 print(f"Salvato: {filename_png}")

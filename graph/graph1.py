@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
 
-labels = ["Scenario A\n(baseline)", "Settimana 1\n(best practice)", "Settimana 2\n(Flickr30k)", "Settimana 3\n(CLIP-L)"]
+labels = ["Fase 1\n(baseline)", "Fase 2\n(best practice)", "Fase 3\n(Flickr30k)", "Fase 4\n(CLIP-L)"]
 values = [8.31, 9.80, 18.99, 25.65]
 colors = ["#9E9E9E", "#90CAF9", "#42A5F5", "#1565C0"]
 
@@ -39,6 +39,5 @@ ax.spines["top"].set_visible(False)
 ax.spines["right"].set_visible(False)
 
 plt.tight_layout()
-plt.savefig("graph1_progression.pdf", dpi=300, bbox_inches="tight")
-plt.savefig("graph1_progression.png", dpi=300, bbox_inches="tight")
-print("Salvato: graph1_progression.pdf / .png")
+plt.savefig("graph/plot1_progression.png", dpi=300, bbox_inches="tight")
+print("Salvato: graph/plot1_progression.pdf / .png")

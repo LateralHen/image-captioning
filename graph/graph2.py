@@ -52,6 +52,5 @@ ax.spines["right"].set_visible(False)
 ax.legend(fontsize=10, loc="upper left")
 
 plt.tight_layout()
-plt.savefig("plot2_cross_vs_indist.pdf", dpi=300, bbox_inches="tight")
-plt.savefig("plot2_cross_vs_indist.png", dpi=300, bbox_inches="tight")
-print("Salvato: plot2_cross_vs_indist.pdf / .png")
+plt.savefig("graph/plot2_cross_vs_indist.png", dpi=300, bbox_inches="tight")
+print("Salvato: graph/plot2_cross_vs_indist.pdf / .png")
