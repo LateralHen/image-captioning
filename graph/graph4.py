@@ -51,7 +51,7 @@ ax.annotate("Best checkpoint\n(epoca 6 \u2014 11.18)",
 # Assi e stile
 ax.set_xlabel("Epoca", fontsize=11)
 ax.set_ylabel("BLEU-4 (subset validation)", fontsize=11)
-ax.set_title("Validation BLEU-4 \u2014 Fase 3 (CLIP ViT-L/14 su Flickr30k)",
+ax.set_title("Validation BLEU-4 \u2014 Fase 4 (CLIP ViT-L/14 su Flickr30k)",
              fontsize=12.5, fontweight="bold", color=MAROON, pad=12)
 ax.set_xlim(0.6, 9.4)
 ax.set_ylim(7.3, 11.8)
