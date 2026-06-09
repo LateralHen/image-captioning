@@ -31,7 +31,7 @@ DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[demo] Carico il modello da {CHECKPOINT} ...")
 model = VisionEncoderDecoderModel.from_pretrained(str(CHECKPOINT))
 model.eval().to(DEVICE)
-print(f"[demo] Modello su {DEVICE}  ✓")
+print(f"[demo] Modello su {DEVICE}")
 
 tokenizer = GPT2Tokenizer.from_pretrained(GPT2_NAME)
 tokenizer.pad_token = tokenizer.eos_token
@@ -49,7 +49,7 @@ eval_transforms = T.Compose([
 @torch.no_grad()
 def generate_caption(pil_image, num_beams: int, max_length: int, no_repeat_ngram: int):
     if pil_image is None:
-        return "⚠️  Carica un'immagine prima."
+        return "Carica un'immagine prima."
 
     pixel_values = eval_transforms(pil_image.convert("RGB")).unsqueeze(0).to(DEVICE)
 
@@ -78,7 +78,7 @@ with gr.Blocks(title="Image Captioning Demo", theme=gr.themes.Soft()) as demo:
 
     gr.Markdown(
         """
-        # 🖼️ Image Captioning Demo
+        # Image Captioning Demo
         **Modello**: CLIP ViT-L + GPT-2 small  |  **Training**: Flickr30k  |  **BLEU-4**: 25.65 (test F8k)
 
         Carica qualsiasi immagine e il modello genera una didascalia in inglese.
@@ -89,12 +89,12 @@ with gr.Blocks(title="Image Captioning Demo", theme=gr.themes.Soft()) as demo:
         with gr.Column(scale=1):
             image_input = gr.Image(type="pil", label="Immagine")
 
-            with gr.Accordion("⚙️ Parametri di generazione", open=False):
+            with gr.Accordion("Parametri di generazione", open=False):
                 num_beams    = gr.Slider(1, 8, value=4, step=1,  label="Beam search (più alto = più lento ma migliore)")
                 max_len      = gr.Slider(10, 50, value=30, step=1, label="Lunghezza massima caption")
                 no_repeat    = gr.Slider(0, 5, value=3, step=1,   label="No-repeat n-gram size")
 
-            btn = gr.Button("✨ Genera caption", variant="primary")
+            btn = gr.Button("Genera caption", variant="primary")
 
         with gr.Column(scale=1):
             caption_output = gr.Textbox(
@@ -128,7 +128,7 @@ with gr.Blocks(title="Image Captioning Demo", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
         """
         ---
-        <sub>Demo locale — nessun dato viene inviato a server esterni.</sub>
+        <sub>Con share=True, il traffico passa attraverso un tunnel temporaneo di Gradio.</sub>
         """
     )
 
